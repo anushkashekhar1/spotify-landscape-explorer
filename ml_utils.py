@@ -62,6 +62,15 @@ def cluster_profile(scaled, feature_cols, labels):
     return cluster_means - overall_mean
 
 
+def top_loadings(pca_model, feature_cols, n=3):
+    """Which original features contribute most to PC1 and PC2, for a plain-
+    language explanation of what the axes actually mean."""
+    loadings = pca_model.components_
+    pc1 = pd.Series(loadings[0], index=feature_cols).abs().sort_values(ascending=False).index[:n].tolist()
+    pc2 = pd.Series(loadings[1], index=feature_cols).abs().sort_values(ascending=False).index[:n].tolist()
+    return pc1, pc2
+
+
 def find_outliers(feat_matrix, df_ref, n=10):
     """Most unusual rows, based on Isolation Forest anomaly score.
     Lower score = more unusual."""

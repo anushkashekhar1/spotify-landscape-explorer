@@ -39,7 +39,7 @@ def genre_counts(sp, artist_ids):
     counts = {}
     for artist_id in ids:
         artist = sp.artist(artist_id)
-        for g in artist["genres"]:
+        for g in artist.get('genres', []):
             counts[g] = counts.get(g, 0) + 1
     return counts
 

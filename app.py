@@ -9,7 +9,7 @@ from sklearn.decomposition import PCA
 
 from ml_utils import (
     AUDIO_FEATURES, RADAR_FEATURES, LOGIN_FEATURES,
-    run_pca, get_recommendations, run_clustering, cluster_profile, find_outliers,
+    run_pca, get_recommendations, run_clustering, cluster_profile, find_outliers, top_loadings,
 )
 from spotify_utils import (
     sp_client, genre_counts, build_track_feature_df, genre_pct,
@@ -160,6 +160,8 @@ if sp is not None:
 
         with tab_pca:
             st.caption("Built from duration, explicit flag, and release year — Spotify no longer exposes audio features to new apps, so this runs on the metadata that's still available.")
+            pc1_top, pc2_top = top_loadings(pca_model, LOGIN_FEATURES)
+            st.info(f"PC1 is mostly driven by {', '.join(pc1_top)}. PC2 is mostly driven by {', '.join(pc2_top)}. Tracks close together on this chart share similar values across those features.")
             fig = px.scatter(
                 pca_df, x="PC1", y="PC2", hover_data=['track', 'artist'],
                 labels={"PC1": f"PC1 ({var1}%)", "PC2": f"PC2 ({var2}%)"},
@@ -379,6 +381,8 @@ if uploaded_file is not None:
             c2.metric("PC2 variance", f"{var2}%")
 
         with tab_landscape:
+            pc1_top, pc2_top = top_loadings(pca_model, AUDIO_FEATURES)
+            st.info(f"PC1 is mostly driven by {', '.join(pc1_top)}. PC2 is mostly driven by {', '.join(pc2_top)}. Tracks close together on this chart share similar values across those features.")
             hover_data = {k: True for k in ['track', 'artist'] if k in pca_df.columns}
             fig = px.scatter(
                 pca_df, x="PC1", y="PC2", color="genre" if has_genre else None,
