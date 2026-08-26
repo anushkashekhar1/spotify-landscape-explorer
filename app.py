@@ -7,7 +7,10 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import plotly.express as px
 import plotly.graph_objects as go
-
+import spotipy 
+from spotipy.oauth2 import SpotifyOAuth
+from sklearn.neighbors import NearestNeighbors
+from sklearn.cluster import KMeans
 # ─────────────────────────────────────────────
 # PAGE CONFIG
 # ─────────────────────────────────────────────
@@ -118,6 +121,100 @@ def run_pca(df_clean, n=2):
     components = pca.fit_transform(scaled)
     return scaled, pca, components
 
+def get_recommendations(track_idx, scaled, df_ref, n=10):
+    nn = NearestNeighbors(n_neighbors=n + 1, metric='cosine')
+    nn.fit(scaled)
+    distances, indices = nn.kneighbors(scaled[track_idx].reshape(1, -1))
+    # first result is the track itself, skip it
+    rec_idx = indices[0][1:]
+    rec_dist = distances[0][1:]
+    out = df_ref.iloc[rec_idx].copy()
+    out['similarity'] = 1 - rec_dist  # cosine distance -> similarity
+    return out
+
+
+def run_clustering(scaled, k):
+    km = KMeans(n_clusters=k, random_state=42, n_init=10)
+    labels = km.fit_predict(scaled)
+    return labels, km
+
+SP_SCOPES = "user-top-read user-library-read user-read-recently-played"
+
+def sp_oauth():
+    return SpotifyOAuth(
+        client_id=st.secrets["spotify"]["client_id"],
+        client_secret=st.secrets["spotify"]["client_secret"],
+        redirect_uri=st.secrets["spotify"]["redirect_uri"],
+        scope=SP_SCOPES,
+        cache_path=None,
+        show_dialog=True,
+    )
+
+def sp_client():
+    oauth = sp_oauth()
+    qp = st.query_params
+    if "code" in qp and "sp_token" not in st.session_state:
+        token = oauth.get_access_token(qp["code"], as_dict=True, check_cache=False)
+        st.session_state["sp_token"] = token["access_token"]
+        st.query_params.clear()
+    if "sp_token" not in st.session_state:
+        st.link_button("🔗 Connect with Spotify", oauth.get_authorize_url())
+        return None
+    return spotipy.Spotify(auth=st.session_state["sp_token"])
+
+def genre_counts(sp, artist_ids):
+    ids = list(dict.fromkeys(artist_ids))
+    counts = {}
+    for i in range(0, len(ids), 50):
+        for artist in sp.artists(ids[i:i+50])["artists"]:
+            for g in artist["genres"]:
+                counts[g] = counts.get(g, 0) + 1
+    return counts
+
+
+def render_my_spotify():
+    st.markdown("## 🔐 My Spotify")
+    sp = sp_client()
+    if sp is None:
+        st.info("Connect your account to see your top tracks, liked songs, and genre breakdown.")
+        return
+
+    me = sp.current_user()
+    st.success(f"Connected as **{me['display_name']}**")
+
+    time_range = st.radio("Time range", ["short_term", "medium_term", "long_term"],
+                           format_func=lambda x: {"short_term":"Last 4 weeks","medium_term":"Last 6 months","long_term":"All time"}[x],
+                           horizontal=True)
+
+    top = sp.current_user_top_tracks(limit=20, time_range=time_range)["items"]
+    saved = sp.current_user_saved_tracks(limit=20)["items"]
+
+    tab_top, tab_saved, tab_genres = st.tabs(["🔥 Top tracks", "💚 Liked songs", "🎼 Genre breakdown"])
+
+    with tab_top:
+        for i, t in enumerate(top, 1):
+            artists = ", ".join(a["name"] for a in t["artists"])
+            st.write(f"{i}. **{t['name']}** — {artists}")
+
+    with tab_saved:
+        for i, item in enumerate(saved, 1):
+            t = item["track"]
+            artists = ", ".join(a["name"] for a in t["artists"])
+            st.write(f"{i}. **{t['name']}** — {artists}")
+
+    with tab_genres:
+        artist_ids = [a["id"] for t in top for a in t["artists"]]
+        gc = genre_counts(sp, artist_ids)
+        if gc:
+            gdf = pd.DataFrame(sorted(gc.items(), key=lambda x: -x[1])[:15], columns=["genre","count"])
+            fig = px.bar(gdf, x="count", y="genre", orientation="h",
+                         template="plotly_dark", color_discrete_sequence=[GREEN])
+            fig.update_layout(plot_bgcolor=PLOT_BG, paper_bgcolor=PAPER_BG, font_color=TEXT_CLR,
+                              yaxis=dict(categoryorder="total ascending"))
+            st.plotly_chart(fig, use_container_width=True)
+        else:
+            st.info("Not enough top track data yet to build a genre breakdown.")
+
 
 # ─────────────────────────────────────────────
 # HEADER
@@ -132,6 +229,9 @@ st.markdown("""
 </div>
 <hr>
 """, unsafe_allow_html=True)
+
+render_my_spotify()
+st.markdown("---")
 
 # ─────────────────────────────────────────────
 # SIDEBAR
@@ -237,12 +337,14 @@ var2 = round(pca_model.explained_variance_ratio_[1] * 100, 1)
 # ─────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────
-tab_heatmap, tab_variance, tab_static, tab_interactive, tab_compare = st.tabs([
+tab_heatmap, tab_variance, tab_static, tab_interactive, tab_compare,  tab_recommend, tab_cluster = st.tabs([
     "🌡️ Correlation Heatmap",
     "📈 Explained Variance",
     "🗺️ Static Landscape",
     "✨ Interactive Landscape",
     "⚖️ Genre Comparison",
+    "🎯 Find Similar Tracks",
+    "🧩 Discover Clusters",
 ])
 
 # ══════════════════════════════════════
@@ -483,6 +585,62 @@ with tab_compare:
                     .format("{:.3f}"),
                 use_container_width=True,
             )
+
+with tab_recommend:
+    st.markdown("### 🎯 Find Similar Tracks")
+    st.markdown("Pick a track and find its nearest neighbors in audio-feature space.")
+
+    if 'track_name' not in df_work.columns:
+        st.warning("Dataset needs a `track_name` column for this feature.")
+    else:
+        track_options = df_work['track_name'] + " — " + df_work.get('artists', '')
+        chosen_track = st.selectbox("Choose a track", track_options)
+        track_idx = track_options[track_options == chosen_track].index[0]
+        # position within df_work (0-based), not the pandas index label
+        pos = df_work.index.get_loc(track_idx)
+
+        n_recs = st.slider("Number of recommendations", 5, 20, 10)
+        recs = get_recommendations(pos, scaled, df_work, n=n_recs)
+
+        cols_to_show = [c for c in ['track_name', 'artists', 'track_genre', 'similarity'] if c in recs.columns]
+        st.dataframe(
+            recs[cols_to_show].style.format({'similarity': '{:.3f}'}).background_gradient(
+                subset=['similarity'], cmap='Greens'
+            ),
+            use_container_width=True,
+        )
+
+with tab_cluster:
+    st.markdown("### 🧩 Discover Clusters")
+    st.markdown("Unsupervised clusters found directly in the audio features — no genre labels used.")
+
+    k = st.slider("Number of clusters", 2, 15, 8)
+    labels, km_model = run_clustering(scaled, k)
+
+    cluster_df = pca_df.copy()
+    cluster_df['cluster'] = labels.astype(str)
+
+    fig_cluster = px.scatter(
+        cluster_df, x="PC1", y="PC2", color="cluster",
+        template="plotly_dark",
+        color_discrete_sequence=px.colors.qualitative.Vivid,
+        opacity=0.6,
+        title="Clusters in PCA Space",
+    )
+    fig_cluster.update_traces(marker=dict(size=4))
+    fig_cluster.update_layout(plot_bgcolor=PLOT_BG, paper_bgcolor=PAPER_BG, font_color=TEXT_CLR)
+    st.plotly_chart(fig_cluster, use_container_width=True)
+
+    st.markdown("#### What defines each cluster")
+    df_feat = pd.DataFrame(scaled, columns=FEATURES)
+    df_feat['cluster'] = labels
+    cluster_means = df_feat.groupby('cluster')[FEATURES].mean()
+    overall_mean = df_feat[FEATURES].mean()
+    deviation = (cluster_means - overall_mean).style.background_gradient(cmap='RdYlGn', axis=None).format("{:.2f}")
+    st.dataframe(deviation, use_container_width=True)
+    st.caption("Green = above dataset average, red = below. Values are in standardized (z-score) units.")
+        
+        
 
 # ─────────────────────────────────────────────
 # FOOTER
