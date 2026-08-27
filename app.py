@@ -12,10 +12,10 @@ from ml_utils import (
     run_pca, get_recommendations, run_clustering, cluster_profile, find_outliers, top_loadings,
 )
 from spotify_utils import (
-    sp_client, genre_counts, build_track_feature_df, genre_pct,
-    nostalgia_index, taste_drift, discovery_vs_comfort, think_you_like_x,
-    mood_by_time_of_day, music_age_gap, forgotten_library, music_bias,
-    obsession_index, music_dna,
+    sp_client, build_artist_genre_map, genres_for_tracks, build_track_feature_df, genre_pct,
+    nostalgia_index, taste_drift, genre_drift_table, discovery_vs_comfort, think_you_like_x,
+    artist_concentration, mood_by_time_of_day, music_age_gap, forgotten_library, music_bias,
+    obsession_index, music_dna, key_findings,
 )
 
 # ─────────────────────────────────────────────
@@ -141,6 +141,35 @@ if sp is not None:
     recent_df = build_track_feature_df(recent)
     combined_df = pd.concat([top_df, saved_df, recent_df]).drop_duplicates(subset='track_id').reset_index(drop=True)
 
+    top_ids = {t['id'] for t in top}
+    recent_ids = [t['id'] for t in recent]
+
+    # one genre lookup per unique artist across everything, reused by every metric below
+    all_artist_ids = [a['id'] for t in (top + saved + recent) for a in t['artists']]
+    genre_map = build_artist_genre_map(sp, all_artist_ids)
+    saved_genres = genres_for_tracks(saved, genre_map)
+    recent_genres = genres_for_tracks(recent, genre_map)
+    saved_pct = genre_pct(saved_genres)
+    recent_pct = genre_pct(recent_genres)
+
+    # compute everything once, into one context used by Key Findings + Music DNA + individual tabs
+    ctx = {}
+    ctx['age_gap'] = music_age_gap(top_df, saved_df, recent_df)
+    ctx['concentration'] = artist_concentration(top)
+    ctx['bias'] = music_bias(combined_df) if len(combined_df) else None
+    ctx['taste_drift'] = taste_drift(saved_pct, recent_pct) if saved_pct and recent_pct else None
+    ctx['forgotten'] = forgotten_library(saved, recent_ids) if saved else None
+
+    st.markdown("### Key findings")
+    findings = key_findings(ctx)
+    if findings:
+        for f in findings:
+            st.write(f"— {f}")
+    else:
+        st.caption("Connect a bit more listening history for findings to appear here.")
+
+    st.markdown("---")
+
     # ── ML section ──
     st.markdown(f"### Analysis <span class='ml-badge'>ML powered</span>", unsafe_allow_html=True)
 
@@ -154,9 +183,21 @@ if sp is not None:
         var1 = round(pca_model.explained_variance_ratio_[0] * 100, 1)
         var2 = round(pca_model.explained_variance_ratio_[1] * 100, 1)
 
-        tab_pca, tab_cluster, tab_recommend, tab_outlier = st.tabs(
-            ["Musical landscape", "Discover clusters", "Find similar tracks", "Outlier finder"]
+        tab_outlier, tab_pca, tab_cluster, tab_recommend = st.tabs(
+            ["Unusual tracks", "Explore the model", "Discover clusters", "Find similar tracks"]
         )
+
+        with tab_outlier:
+            n_out = st.slider("Number of outliers", 3, 10, 5, key="sp_out_n")
+            outliers = find_outliers(scaled, combined_df, LOGIN_FEATURES, n=n_out)
+            for _, row in outliers.iterrows():
+                c1, c2 = st.columns([1, 5])
+                if row.get('album_image'):
+                    c1.image(row['album_image'], width=64)
+                c2.write(f"**{row['track_name']}** — {row['artists']}")
+                c2.caption(f"Why: {row['reason']}")
+            with st.expander("How it works"):
+                st.write("Each track's duration, explicit flag, and release year are standardized, then run through an Isolation Forest, which scores how far a point sits from the rest of the data. The 'why' is whichever single feature deviates furthest from your library's average for that track.")
 
         with tab_pca:
             st.caption("Built from duration, explicit flag, and release year — Spotify no longer exposes audio features to new apps, so this runs on the metadata that's still available.")
@@ -169,16 +210,15 @@ if sp is not None:
             )
             fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, font_color=TEXT_MAIN)
             st.plotly_chart(fig, use_container_width=True)
+            with st.expander("How it works"):
+                st.write("PCA (Principal Component Analysis) compresses the standardized features down to 2 dimensions while keeping as much of the original variation as possible, so similar tracks end up near each other on the chart.")
 
         with tab_cluster:
             k = st.slider("Number of clusters", 2, 6, 3, key="sp_k")
             labels, _ = run_clustering(scaled, k)
             cdf = pca_df.copy()
             cdf['cluster'] = labels.astype(str)
-            fig = px.scatter(
-                cdf, x="PC1", y="PC2", color="cluster",
-                template="plotly_white", opacity=0.7,
-            )
+            fig = px.scatter(cdf, x="PC1", y="PC2", color="cluster", template="plotly_white", opacity=0.7)
             fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, font_color=TEXT_MAIN)
             st.plotly_chart(fig, use_container_width=True)
 
@@ -192,106 +232,148 @@ if sp is not None:
                 recs[['track_name', 'artists', 'similarity']].style.format({'similarity': '{:.3f}'}),
                 use_container_width=True,
             )
-
-        with tab_outlier:
-            n_out = st.slider("Number of outliers", 3, 10, 5, key="sp_out_n")
-            outliers = find_outliers(scaled, combined_df, n=n_out)
-            st.dataframe(
-                outliers[['track_name', 'artists', 'anomaly_score']].style.format({'anomaly_score': '{:.3f}'}),
-                use_container_width=True,
-            )
+            st.caption("Matches are based only on duration, explicit flag, and release year — without real audio features, this can't judge how a track actually sounds.")
 
     st.markdown("---")
 
     # ── personality section ──
     st.markdown("### Your listening personality")
+    scores = {'genre_diversity': len(set(saved_genres) | set(recent_genres))}
+    if ctx['taste_drift'] is not None:
+        scores['taste_drift'] = ctx['taste_drift']
+    if ctx['concentration']:
+        scores['concentration_top5'] = ctx['concentration'][5]
 
-    top_ids = {t['id'] for t in top}
-    saved_ids = [t['id'] for t in saved]
-    recent_ids = [t['id'] for t in recent]
+    tab_names = ["Nostalgia", "Taste drift", "Discovery vs comfort"]
+    tylx = think_you_like_x(saved_pct, recent_pct)
+    if tylx:
+        tab_names.append("Think you like X")
+    tab_names += ["Artist concentration", "Mood by time of day", "Music age gap", "Forgotten library", "Music bias", "Music DNA"]
+    tabs = st.tabs(tab_names)
+    tab_map = dict(zip(tab_names, tabs))
 
-    top_artist_ids = [a['id'] for t in top for a in t['artists']]
-    saved_artist_ids = [a['id'] for t in saved for a in t['artists']]
-    recent_artist_ids = [a['id'] for t in recent for a in t['artists']]
-
-    saved_genres = genre_counts(sp, saved_artist_ids)
-    recent_genres = genre_counts(sp, recent_artist_ids)
-    saved_pct = genre_pct(saved_genres)
-    recent_pct = genre_pct(recent_genres)
-
-    scores = {}
-
-    tab_nost, tab_drift, tab_disc, tab_like, tab_mood, tab_age, tab_forgot, tab_bias, tab_dna = st.tabs([
-        "Nostalgia", "Taste drift", "Discovery vs comfort", "Think you like X",
-        "Mood by time of day", "Music age gap", "Forgotten library", "Music bias", "Music DNA",
-    ])
-
-    with tab_nost:
+    with tab_map["Nostalgia"]:
         if len(saved_df):
             n = nostalgia_index(saved_df)
             scores['nostalgia'] = n['score']
-            st.metric("Nostalgia index", f"{n['score']}/100")
-            st.write(f"Average track age: {n['avg_age_years']} years")
-            st.write(f"Oldest track in your saved list: {n['oldest_track']} ({n['oldest_year']})")
+            st.metric("Nostalgia index", f"{n['score']}/100 — {n['label']}")
+            st.write(f"Your saved library averages {n['avg_age_years']} years old.")
+            fig = px.histogram(saved_df, x='release_year', nbins=15, template="plotly_white",
+                                color_discrete_sequence=[ACCENT])
+            fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, font_color=TEXT_MAIN,
+                               xaxis_title="Release year", yaxis_title="Tracks")
+            st.plotly_chart(fig, use_container_width=True)
+            c1, c2 = st.columns(2)
+            with c1:
+                if n.get('oldest_image'):
+                    st.image(n['oldest_image'], width=100)
+                st.caption(f"Oldest: {n['oldest_track']} ({n['oldest_year']})")
+            with c2:
+                if n.get('newest_image'):
+                    st.image(n['newest_image'], width=100)
+                st.caption(f"Newest: {n['newest_track']} ({n['newest_year']})")
+            with st.expander("How it works"):
+                st.write("Score = average (current year − release year) across your saved tracks, scaled so 30 years old lands near 100.")
         else:
             st.info("Save some tracks to see this.")
 
-    with tab_drift:
-        drift = taste_drift(saved_pct, recent_pct)
-        scores['taste_drift'] = drift
-        st.metric("Taste drift", f"{drift}/100")
-        st.caption("Higher means your recent listening looks quite different from what you've saved.")
+    with tab_map["Taste drift"]:
+        if saved_pct and recent_pct:
+            drift = ctx['taste_drift']
+            st.metric("Taste drift", f"{drift}/100")
+            drift_df = genre_drift_table(saved_pct, recent_pct)
+            if len(drift_df):
+                fig = px.bar(drift_df, x='genre', y=['saved', 'recent'], barmode='group',
+                             template="plotly_white", color_discrete_sequence=[TEXT_SOFT, ACCENT])
+                fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, font_color=TEXT_MAIN,
+                                   yaxis_title="Share of tracks (%)")
+                st.plotly_chart(fig, use_container_width=True)
+                biggest = drift_df.iloc[0]
+                direction = "increased" if biggest['delta'] > 0 else "decreased"
+                st.write(f"{biggest['genre']} has {direction} by {abs(biggest['delta']):.1f} percentage points in your recent listening.")
+            with st.expander("How it works"):
+                st.write("Compares your saved-track genre distribution against your recently-played genre distribution; the drift score is the total difference between the two, scaled to 0-100.")
+        else:
+            st.info("Not enough genre data yet.")
 
-    with tab_disc:
-        dvc = discovery_vs_comfort(recent, top_ids)
-        scores['discovery_pct'] = dvc['discovery_pct']
-        c1, c2 = st.columns(2)
-        c1.metric("Discovery", f"{dvc['discovery_pct']}%")
-        c2.metric("Comfort", f"{dvc['comfort_pct']}%")
+    with tab_map["Discovery vs comfort"]:
+        dvc = discovery_vs_comfort(recent, top_ids, recent_genres)
+        if dvc:
+            scores['discovery_pct'] = dvc['discovery_pct']
+            c1, c2 = st.columns(2)
+            c1.metric("Discovery", f"{dvc['discovery_pct']}%")
+            c2.metric("Comfort", f"{dvc['comfort_pct']}%")
+            st.write(f"{dvc['unique_artists']} unique artists in your recent listening, {dvc['rare_artists']} of them appearing only once, across {dvc['unique_genres']} genres.")
+            with st.expander("How it works"):
+                st.write("Comfort = share of recently-played tracks that also appear in your Top Tracks. Discovery is the remainder. The supporting numbers show how spread out that listening actually is.")
+        else:
+            st.info("Not enough recent listening data yet.")
 
-    with tab_like:
-        tylx = think_you_like_x(saved_pct, recent_pct)
-        if tylx:
+    if tylx:
+        with tab_map["Think you like X"]:
             if tylx['mismatch']:
                 st.write(f"You save a lot of {tylx['saved_top_genre']}, but you're actually listening to {tylx['recent_top_genre']} the most.")
             else:
                 st.write(f"Your saved and recent listening agree — mostly {tylx['saved_top_genre']}.")
-        else:
-            st.info("Not enough genre data yet.")
 
-    with tab_mood:
-        mood_df = mood_by_time_of_day(recent_items)
+    with tab_map["Artist concentration"]:
+        curve = ctx['concentration']
+        if curve:
+            curve_df = pd.DataFrame({'Top N artists': [str(n) for n in curve], 'Share of tracks (%)': list(curve.values())})
+            fig = px.line(curve_df, x='Top N artists', y='Share of tracks (%)', markers=True,
+                          template="plotly_white", color_discrete_sequence=[ACCENT])
+            fig.update_layout(plot_bgcolor=BG, paper_bgcolor=BG, font_color=TEXT_MAIN)
+            st.plotly_chart(fig, use_container_width=True)
+            st.caption("Based on how often each artist appears in your Top Tracks list — Spotify doesn't expose real play counts, so this is a proxy for concentration, not a literal listening percentage.")
+        else:
+            st.info("Not enough data yet.")
+
+    with tab_map["Mood by time of day"]:
+        mood_df = mood_by_time_of_day(recent_items, genre_map=genre_map)
         if len(mood_df):
             st.dataframe(mood_df, use_container_width=True)
         else:
             st.info("Not enough recently-played data with timestamps yet.")
 
-    with tab_age:
-        gap = music_age_gap(top_df, saved_df, recent_df)
+    with tab_map["Music age gap"]:
+        gap = ctx['age_gap']
         c1, c2, c3 = st.columns(3)
         c1.metric("Top tracks", f"{gap['top']} yrs old" if gap['top'] is not None else "—")
         c2.metric("Saved tracks", f"{gap['saved']} yrs old" if gap['saved'] is not None else "—")
         c3.metric("Recently played", f"{gap['recent']} yrs old" if gap['recent'] is not None else "—")
 
-    with tab_forgot:
-        fg = forgotten_library(saved_ids, recent_ids, len(saved_ids))
-        st.metric("Forgotten tracks", f"{fg['forgotten_count']} ({fg['forgotten_pct']}%)")
-        st.caption("Saved tracks that haven't shown up in your recent listening.")
+    with tab_map["Forgotten library"]:
+        fg = ctx['forgotten']
+        if fg:
+            st.metric("Forgotten tracks", f"{fg['forgotten_count']} ({fg['forgotten_pct']}%)")
+            st.caption("Saved tracks that haven't shown up in your recent listening.")
+            for t in fg['sample'][:5]:
+                c1, c2 = st.columns([1, 5])
+                if t.get('album_image'):
+                    c1.image(t['album_image'], width=64)
+                c2.write(f"{t['track_name']} — {t['artists']}")
+        else:
+            st.info("Save some tracks to see this.")
 
-    with tab_bias:
-        bias = music_bias(combined_df)
+    with tab_map["Music bias"]:
+        bias = ctx['bias']
         if bias:
-            st.write(f"Your biggest bias: {bias['pct']}% of your tracks fall into '{bias['label']}'.")
+            st.write(f"Your biggest measurable pattern: {bias['pct']}% of your tracks fall into '{bias['label']}'.")
         else:
             st.info("Not enough data yet.")
 
-    with tab_dna:
+    with tab_map["Music DNA"]:
         obs = obsession_index(top)
         scores['obsession'] = obs['score']
         dna = music_dna(scores)
         if dna:
-            for label, val in dna.items():
-                st.metric(label, val)
+            fig = go.Figure()
+            vals = list(dna.values()) + [list(dna.values())[0]]
+            cats = list(dna.keys()) + [list(dna.keys())[0]]
+            fig.add_trace(go.Scatterpolar(r=vals, theta=cats, fill='toself', line_color=ACCENT))
+            fig.update_layout(polar=dict(radialaxis=dict(visible=True, range=[0, 100])),
+                               paper_bgcolor=BG, font_color=TEXT_MAIN, showlegend=False)
+            st.plotly_chart(fig, use_container_width=True)
         st.caption(f"Most played artist in your top tracks: {obs['top_artist']}")
 
 else:
@@ -457,8 +539,8 @@ if uploaded_file is not None:
 
         with tab_outlier_csv:
             n_out = st.slider("Number of outliers", 5, 30, 10, key="csv_out_n")
-            outliers = find_outliers(scaled, df_work, n=n_out)
-            cols_show = [c for c in ['track_name', 'artists', 'track_genre', 'anomaly_score'] if c in outliers.columns]
+            outliers = find_outliers(scaled, df_work, AUDIO_FEATURES, n=n_out)
+            cols_show = [c for c in ['track_name', 'artists', 'track_genre', 'anomaly_score', 'reason'] if c in outliers.columns]
             st.dataframe(outliers[cols_show].style.format({'anomaly_score': '{:.3f}'}), use_container_width=True)
 
 # ─────────────────────────────────────────────
@@ -467,6 +549,6 @@ if uploaded_file is not None:
 st.markdown("---")
 st.markdown(f"""
 <div style='text-align:center; color:{TEXT_SOFT}; font-size:0.85rem; padding: 1rem 0;'>
-    Built with Streamlit · Scikit-learn · Plotly · Spotify Web API
+    Under the hood: Spotify Web API → Pandas → feature engineering → PCA / clustering / Isolation Forest → Plotly → Streamlit
 </div>
 """, unsafe_allow_html=True)

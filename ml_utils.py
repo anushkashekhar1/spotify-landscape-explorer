@@ -71,12 +71,37 @@ def top_loadings(pca_model, feature_cols, n=3):
     return pc1, pc2
 
 
-def find_outliers(feat_matrix, df_ref, n=10):
-    """Most unusual rows, based on Isolation Forest anomaly score.
-    Lower score = more unusual."""
+FEATURE_LABELS = {
+    'duration_ms': 'track length', 'explicit': 'explicit content', 'release_year': 'release year',
+    'danceability': 'danceability', 'energy': 'energy', 'loudness': 'loudness',
+    'speechiness': 'speechiness', 'acousticness': 'acousticness', 'instrumentalness': 'instrumentalness',
+    'liveness': 'liveness', 'valence': 'mood (valence)', 'tempo': 'tempo',
+}
+
+
+def find_outliers(feat_matrix, df_ref, feature_cols, n=10):
+    """Most unusual rows, based on Isolation Forest anomaly score, with a
+    plain-language reason drawn from whichever feature deviates furthest
+    from the mean (feat_matrix is already standardized, so its values ARE
+    z-scores)."""
     iso = IsolationForest(contamination='auto', random_state=42)
     iso.fit(feat_matrix)
     anomaly_score = iso.score_samples(feat_matrix)
+
+    feat_df = pd.DataFrame(feat_matrix, columns=feature_cols, index=df_ref.index)
+    abs_z = feat_df.abs()
+    top_feature = abs_z.idxmax(axis=1)
+    top_z = abs_z.max(axis=1)
+
+    reasons = []
+    for i, (feat, z) in enumerate(zip(top_feature, top_z)):
+        if z < 1.2:
+            reasons.append("no single standout trait, just an unusual overall mix")
+            continue
+        direction = "unusually high" if feat_df.iloc[i][feat] > 0 else "unusually low"
+        reasons.append(f"{direction} {FEATURE_LABELS.get(feat, feat)}")
+
     out = df_ref.copy()
     out['anomaly_score'] = anomaly_score
+    out['reason'] = reasons
     return out.sort_values('anomaly_score').head(n)
