@@ -12,4 +12,4 @@
 
    EXPOSE 8501
 
-   CMD ["sh", "-c", "streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
+   CMD ["sh", "-c", "mkdir -p /app/.streamlit && cp /etc/secrets/secrets.toml /app/.streamlit/secrets.toml 2>/dev/null; streamlit run app.py --server.port=${PORT:-8501} --server.address=0.0.0.0 --server.headless=true"]
