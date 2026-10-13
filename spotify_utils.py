@@ -82,7 +82,7 @@ def build_track_feature_df(tracks):
             'release_year': _parse_year(t.get('album', {}).get('release_date', '')),
             'album_image': _album_image(t),
         })
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(rows, columns=['track_id', 'track_name', 'artists', 'duration_ms', 'explicit', 'release_year', 'album_image'])
     return df.dropna(subset=['release_year'])
 
 
