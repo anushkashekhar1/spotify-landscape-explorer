@@ -1,0 +1,58 @@
+   name: CI/CD Pipeline
+
+   on:
+     push:
+       branches: [main]
+     pull_request:
+       branches: [main]
+
+   jobs:
+     test:
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+
+         - uses: actions/setup-python@v5
+           with:
+             python-version: "3.11"
+             cache: pip
+
+         - name: Install dependencies
+           run: |
+             pip install -r requirements.txt
+             pip install flake8 pytest
+
+         - name: Lint (syntax errors and undefined names only)
+           run: flake8 . --select=E9,F63,F7,F82 --show-source --statistics
+
+         - name: Run tests
+           run: pytest -q
+
+     docker-build:
+       needs: test
+       runs-on: ubuntu-latest
+       steps:
+         - uses: actions/checkout@v4
+
+         - name: Build Docker image
+           run: docker build -t spotify-explorer:${{ github.sha }} .
+
+         - name: Smoke test container
+           run: |
+             docker run -d --name app -p 8501:8501 spotify-explorer:${{ github.sha }}
+             for i in $(seq 1 30); do
+               if curl -fs http://localhost:8501/_stcore/health | grep -q ok; then
+                 echo "App is healthy"; exit 0
+               fi
+               sleep 2
+             done
+             docker logs app
+             exit 1
+
+     deploy:
+       needs: docker-build
+       if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+       runs-on: ubuntu-latest
+       steps:
+         - name: Trigger Render deploy
+           run: curl -fsS -X POST "${{ secrets.RENDER_DEPLOY_HOOK_URL }}"
